@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import pickle
 import typing as t
@@ -14,6 +15,7 @@ from ..runner.utils import PAYLOAD_META_HEADER
 from ..runner.utils import payload_paramss_to_batch_params
 from ..server.base_app import BaseAppFactory
 from ..runner.container import AutoContainer
+from ..runner.container import Payload
 from ..marshal.dispatcher import CorkDispatcher
 from ..configuration.containers import BentoMLContainer
 
@@ -166,16 +168,45 @@ class RunnerAppFactory(BaseAppFactory):
             assert self._is_ready
             if not requests:
                 return []
-            params_list: list[Params[t.Any]] = []
-            for r in requests:
-                r_ = await r.body()
-                params_list.append(pickle.loads(r_))
+
+            requests = list(requests)
+            arg_nums = set(r.headers["args-number"] for r in requests)
+            assert len(arg_nums) == 1, "All requests must have the same arguments number"
+            arg_num = int(list(arg_nums)[0])
 
             input_batch_dim, output_batch_dim = runner_method.config.batch_dim
 
-            batched_params, indices = payload_paramss_to_batch_params(
-                params_list, input_batch_dim
-            )
+            if arg_num == 1:
+                # test all request has the same container?
+                container = requests[0].headers["payload-container"]
+                payload_list = []
+                body_list = await asyncio.gather(*[r.body() for r in requests])
+                for idx, r in enumerate(requests):
+                    data = body_list[idx]
+                    meta = json.loads(r.headers["payload-meta"])
+                    batch_size = int(r.headers["batch-size"])
+                    payload_list.append(
+                        Payload(
+                            data = data,
+                            meta=meta,
+                            batch_size=batch_size,
+                            container=container,
+                        )
+                    )
+
+                batched_param, indices = AutoContainer.from_batch_payloads(payload_list, batch_dim=input_batch_dim)
+                batched_params = Params(batched_param)
+
+            else:
+
+                params_list: list[Params[t.Any]] = []
+                for r in requests:
+                    r_ = await r.body()
+                    params_list.append(pickle.loads(r_))
+
+                batched_params, indices = payload_paramss_to_batch_params(
+                    params_list, input_batch_dim
+                )
 
             batch_ret = await runner_method.async_run(
                 *batched_params.args, **batched_params.kwargs
