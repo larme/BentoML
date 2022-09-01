@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import abc
+import base64
 import pickle
 import typing as t
 import itertools
@@ -11,6 +12,10 @@ from simple_di import Provide
 
 from ..types import LazyType
 from ..configuration.containers import BentoMLContainer
+
+import pyarrow.plasma as plasma
+#plasma_db = plasma.connect("/tmp/plasma")
+plasma_db = None
 
 SingleType = t.TypeVar("SingleType")
 BatchType = t.TypeVar("BatchType")
@@ -119,19 +124,41 @@ class NdarrayContainer(
         cls,
         batch: ext.NpNDArray,
         batch_dim: int,
-        plasma_db: ext.PlasmaClient | None = Provide[BentoMLContainer.plasma_db],
+        plasma_db: ext.PlasmaClient | None = plasma_db,
     ) -> Payload:
         if plasma_db:
             return cls.create_payload(
                 plasma_db.put(batch).binary(),
                 batch.shape[batch_dim],
-                {"plasma": True},
+                {"format": "plasma"},
+            )
+
+        import numpy as np
+        # skip 0-dimensional array
+        if batch.shape:
+
+            buffers: list[pickle.PickleBuffer] = []
+            if not (batch.flags["C_CONTIGUOUS"] or batch.flags["F_CONTIGUOUS"]):
+                # TODO: use fortan contiguous if it's faster
+                batch = np.ascontiguousarray(batch)
+            bs = pickle.dumps(batch, protocol=5, buffer_callback=buffers.append)
+            bs_str = base64.b64encode(bs).decode("ascii")
+            buffer_bs = buffers[0].raw().tobytes()
+            # release memory
+            buffers[0].release()
+            return cls.create_payload(
+                buffer_bs,
+                batch.shape[batch_dim],
+                {
+                    "format": "pickle5",
+                    "pickle_bytes": bs_str,
+                }
             )
 
         return cls.create_payload(
             pickle.dumps(batch),
             batch.shape[batch_dim],
-            {"plasma": False},
+            {"format": "default"},
         )
 
     @classmethod
@@ -139,13 +166,21 @@ class NdarrayContainer(
     def from_payload(
         cls,
         payload: Payload,
-        plasma_db: ext.PlasmaClient | None = Provide[BentoMLContainer.plasma_db],
+        plasma_db: ext.PlasmaClient | None = plasma_db,
     ) -> ext.NpNDArray:
-        if payload.meta.get("plasma"):
+        format = payload.meta.get("format", "default")
+        if format == "plasma":
             import pyarrow.plasma as plasma
 
             assert plasma_db
             return plasma_db.get(plasma.ObjectID(payload.data))
+
+        if format == "pickle5":
+            import base64
+            bs_str = payload.meta["pickle_bytes"]
+            bs = base64.b64decode(bs_str)
+            recovered_buffers = [pickle.PickleBuffer(payload.data)]
+            return pickle.loads(bs, buffers=recovered_buffers)
 
         return pickle.loads(payload.data)
 
@@ -156,7 +191,7 @@ class NdarrayContainer(
         batch: ext.NpNDArray,
         indices: t.Sequence[int],
         batch_dim: int = 0,
-        plasma_db: ext.PlasmaClient | None = Provide[BentoMLContainer.plasma_db],
+        plasma_db: ext.PlasmaClient | None = plasma_db,
     ) -> list[Payload]:
 
         batches = cls.batch_to_batches(batch, indices, batch_dim)
@@ -172,7 +207,7 @@ class NdarrayContainer(
         cls,
         payloads: t.Sequence[Payload],
         batch_dim: int = 0,
-        plasma_db: "ext.PlasmaClient" | None = Provide[BentoMLContainer.plasma_db],
+        plasma_db: "ext.PlasmaClient" | None = plasma_db,
     ) -> t.Tuple["ext.NpNDArray", list[int]]:
         batches = [cls.from_payload(payload, plasma_db) for payload in payloads]
         return cls.batches_to_batch(batches, batch_dim)

@@ -29,6 +29,39 @@ if TYPE_CHECKING:  # pragma: no cover
     R = t.TypeVar("R")
 
 
+def to_file_like_obj(iterable: t.Iterable):
+    chunk = b''
+    offset = 0
+    it = iter(iterable)
+
+    def up_to_iter(size: int):
+        nonlocal chunk, offset
+
+        while size:
+            if offset == len(chunk):
+                try:
+                    chunk = next(it)
+                except StopIteration:
+                    break
+                else:
+                    offset = 0
+            to_yield = min(size, len(chunk) - offset)
+            offset = offset + to_yield
+            size -= to_yield
+            yield chunk[offset - to_yield:offset]
+
+    import io
+    class FileLikeObj(io.BufferedIOBase):
+        def read(self, size=-1):
+            return b''.join(up_to_iter(float('inf') if size is None or size < 0 else size))
+
+    return FileLikeObj()
+
+def chunks(lst, n):
+    """Yield successive n-sized chunks from lst."""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
 class RemoteRunnerClient(RunnerHandle):
     def __init__(self, runner: Runner):  # pylint: disable=super-init-not-called
         self._runner = runner
@@ -133,27 +166,44 @@ class RemoteRunnerClient(RunnerHandle):
 
         inp_batch_dim = __bentoml_method.config.batch_dim[0]
 
-        payload_params = Params[Payload](*args, **kwargs).map(
-            functools.partial(AutoContainer.to_payload, batch_dim=inp_batch_dim)
-        )
+        headers = {
+            "Bento-Name": component_context.bento_name,
+            "Bento-Version": component_context.bento_version,
+            "Runner-Name": self._runner.name,
+            "Yatai-Bento-Deployment-Name": component_context.yatai_bento_deployment_name,
+            "Yatai-Bento-Deployment-Namespace": component_context.yatai_bento_deployment_namespace,
+        }
 
-        if __bentoml_method.config.batchable:
-            if not payload_params.map(lambda i: i.batch_size).all_equal():
-                raise ValueError(
-                    "All batchable arguments must have the same batch size."
-                )
+        total_args_num = len(args) + len(kwargs)
+        headers["Args-Number"] = str(total_args_num)
+        if total_args_num == 1:
+            # FIXME: also considering kargs
+            payload = AutoContainer.to_payload(args[0], batch_dim=inp_batch_dim)
+            headers["Payload-Meta"] = json.dumps(payload.meta)
+            headers["Payload-Container"] = payload.container
+            headers["Batch-Size"] = str(payload.batch_size)
+            data = payload.data
+
+        else:
+            payload_params = Params[Payload](*args, **kwargs).map(
+                functools.partial(AutoContainer.to_payload, batch_dim=inp_batch_dim)
+            )
+
+            if __bentoml_method.config.batchable:
+                if not payload_params.map(lambda i: i.batch_size).all_equal():
+                    raise ValueError(
+                        "All batchable arguments must have the same batch size."
+                    )
+
+            data = pickle.dumps(payload_params)
 
         path = "" if __bentoml_method.name == "__call__" else __bentoml_method.name
+
+        #f = to_file_like_obj(chunks(data, 2 ** 16))
         async with self._client.post(
             f"{self._addr}/{path}",
-            data=pickle.dumps(payload_params),  # FIXME: pickle inside pickle
-            headers={
-                "Bento-Name": component_context.bento_name,
-                "Bento-Version": component_context.bento_version,
-                "Runner-Name": self._runner.name,
-                "Yatai-Bento-Deployment-Name": component_context.yatai_bento_deployment_name,
-                "Yatai-Bento-Deployment-Namespace": component_context.yatai_bento_deployment_namespace,
-            },
+            data=data,  # FIXME: pickle inside pickle
+            headers=headers,
         ) as resp:
             body = await resp.read()
 
