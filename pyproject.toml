@@ -153,7 +153,7 @@ tracing = [
     "bentoml[tracing-zipkin]",
 ]
 tracing-jaeger = ["opentelemetry-exporter-jaeger==1.17.0"]
-tracing-zipkin = ["opentelemetry-exporter-zipkin==1.17.0"]
+tracing-zipkin = ["opentelemetry-exporter-zipkin==1.18.0"]
 tracing-otlp = ["opentelemetry-exporter-otlp==1.17.0"]
 monitor-otlp = ["opentelemetry-exporter-otlp-proto-http==1.17.0"]
 
