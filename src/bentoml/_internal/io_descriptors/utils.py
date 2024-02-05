@@ -72,7 +72,7 @@ class SSE:
             event["data"] = data_buffer.getvalue()
             data_buffer.close()
 
-        print("debug sse:", event)
+        #print("debug sse:", event)
         return SSE(**event)
 
     @classmethod
